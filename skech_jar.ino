@@ -7,6 +7,7 @@
 
 // debug
 #define LOG(...)        { char buf[256]; sprintf(buf, __VA_ARGS__); Serial.println(buf); }
+#define HAS_OLED        (1)
 
 enum class RUNNING_STATE : char
 {
@@ -73,6 +74,7 @@ enum COMMAND : char
     CMD_KEEP,
     CMD_SET_KP,
     CMD_SET_TI,
+    CMD_SET_PHASE_DELAY,
 };
 
 struct COMMAND_DATA
@@ -94,6 +96,7 @@ volatile float targetTemperature = 0;
 volatile float temperatureErrorIntegral = 0;
 volatile float Kp;
 volatile float Ti;
+volatile unsigned short phaseDelayUs = 1200;
 COMMAND_DATA commands[COMMAND_DATA_MAX];
 
 // input
@@ -108,6 +111,8 @@ COMMAND_DATA commands[COMMAND_DATA_MAX];
 
 // adc
 #define THERMAL_PIN     (0)
+
+#define PULSE_PIN       (12)
 
 #define OLED_ADDRESS    (0x3C)
 
@@ -142,7 +147,9 @@ COMMAND_DATA commands[COMMAND_DATA_MAX];
 #define TONE_RA6  (1760)
 #define TONE_SI6  (1975)
 
+#if HAS_OLED
 SSD1306AsciiAvrI2c oled;
+#endif
 TimerOne timer1;
 SoftwareSerial serialBT(10, 9);
 
@@ -153,6 +160,7 @@ void setup()
     Serial.begin(9600);
     LOG("Booting...");
 
+    LOG("Setup io pins...");
     pinMode(POWER_SW_PIN, INPUT);
     pinMode(ZERO_CROSS_PIN, INPUT);
     pinMode(ZERO_CROSS_DUMMY_PIN, INPUT);
@@ -161,16 +169,18 @@ void setup()
     pinMode(BUZZER_PIN, OUTPUT);
     pinMode(HEAT_CTRL_PIN, OUTPUT);
     pinMode(LED_BUILTIN, OUTPUT);
-
-    analogReference(INTERNAL);
-    attachInterrupt(1, zeroCrossInterrupt, FALLING);
+    pinMode(PULSE_PIN, OUTPUT);
 
     digitalWrite(POWER_ON_PIN, HIGH);
     digitalWrite(HEAT_CTRL_PIN, LOW);
 
+#if HAS_OLED
+    LOG("Setup OLED...");
     oled.begin(&Adafruit128x32, OLED_ADDRESS);
     oled.setFont(System5x7);
+#endif
 
+    LOG("Setup EEPROM...");
     EEPROM.get(EEPROM_Kp_ADDR, Kp);
     if(fabsf(Kp) <= __FLT_EPSILON__)
     {
@@ -187,6 +197,8 @@ void setup()
     LOG("Kp = %d.%04d", (int)(Kp), (int)((Kp - (int)Kp)*10000));
     LOG("Ti = %d.%04d", (int)(Ti), (int)((Ti - (int)Ti)*10000));
 
+    LOG("OK");
+
     pinMode(BUZZER_PIN, OUTPUT);
     tone(BUZZER_PIN, 2000);
     delay(100);
@@ -197,25 +209,35 @@ void setup()
     serialBT.begin(2400);
     rebootBT();
 
+    analogReference(INTERNAL);
+    attachInterrupt(1, zeroCrossInterrupt, RISING);
+
     timer1.initialize(100);
     timer1.attachInterrupt(timerInterrupt);
 }
 
 void zeroCrossInterrupt()
 {
+    digitalWrite(PULSE_PIN, digitalRead(ZERO_CROSS_PIN));
+
     static unsigned long lastTime = 0;
+    static unsigned long ticks = 0;
 
     unsigned long now = micros();
     unsigned long d = now - lastTime;
+    lastTime = now;
 
-    if(d < 5000) // ignore irregular value
+    if(d < 1000) // ignore irregular value
         return;
     
     zeroCrossInterval = d;
-    lastTime = now;
 
-    heatControlMode = HEAT_CTRL_MODE::UP;
-    heatControlTime = now + (zeroCrossInterval>>1) - 1200;
+    ticks++;
+    if((ticks&63) == 0)
+    {
+        heatControlMode = HEAT_CTRL_MODE::UP;
+        heatControlTime = now + (zeroCrossInterval>>1) - phaseDelayUs;
+    }
 }
 
 void timerInterrupt()
@@ -235,10 +257,10 @@ void timerInterrupt()
             case HEAT_CTRL_MODE::UP:
                 {
                     digitalWrite(HEAT_CTRL_PIN, HIGH);
-                    const auto rate = calcPowerRateFeedbacked();
+                    const auto rate = 0;//calcPowerRateFeedbacked();
                     status.power = (char)clamp(rate*100.f, 0.f, 100.f);
                     heatControlMode = HEAT_CTRL_MODE::DOWN;
-                    heatControlTime = now + calcHeatPowerDownDuration(rate);
+                    heatControlTime = now + 1000;//calcHeatPowerDownDuration(rate);
                     break;
                 }
         }
@@ -599,6 +621,9 @@ void processCommand()
             LOG("Set Ti %d", (int)(Ti*256));
             ++status.cmdid;
             break;
+        case CMD_SET_PHASE_DELAY:
+            phaseDelayUs = *reinterpret_cast<unsigned short*>(data.params);
+            break;
     }
 
     previousTime = now;
@@ -607,13 +632,15 @@ void processCommand()
 
 template<typename Fn> void oledPrint(int cols, Fn&& fn)
 {
+#if HAS_OLED
     auto width = oled.fontWidth() + 1;
     auto curcol = oled.col();
     fn();
-    auto left = cols*width - oled.col();
+    auto left = (curcol + cols*width) - oled.col();
     if(left > 0)
         oled.clearField(oled.col(), oled.row(), (left + width - 1)/width);
     oled.setCol(curcol + width*cols);
+#endif
 }
 
 void display()
@@ -626,6 +653,7 @@ void display()
     {
         interval = now;
 
+#if HAS_OLED
         oled.home();
         oledPrint(7, [](){
             oled.print("ST:");
@@ -653,13 +681,14 @@ void display()
         oled.setCursor(0, 2);
         oledPrint(10, [](){
             oled.print("LEFT:");
-            oled.print((int)status.remainTime);
+            oled.print((int)zeroCrossInterval);
         });  
 
         oledPrint(10, [](){
             oled.print("UDC:");
-            oled.print((int)count++);
-        });          
+            oled.print((int)phaseDelayUs);
+        });
+#endif 
 
         //
         char strbuf[64];
