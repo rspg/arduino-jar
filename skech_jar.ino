@@ -174,6 +174,8 @@ void setup()
     digitalWrite(POWER_ON_PIN, HIGH);
     digitalWrite(HEAT_CTRL_PIN, LOW);
 
+    delay(1000);
+
 #if HAS_OLED
     LOG("Setup OLED...");
     oled.begin(&Adafruit128x32, OLED_ADDRESS);
@@ -355,6 +357,7 @@ BT_RESPONSE waitBTResponse(unsigned long timeout)
         while(serialBT.available())
         {
             int c = serialBT.read();
+
             if(c == '\n')
             {
                 response[index] = '\0';
@@ -362,10 +365,10 @@ BT_RESPONSE waitBTResponse(unsigned long timeout)
 
                 if(strncmp(response, "AOK", 3) == 0)
                     return BT_RESPONSE::AOK;
-                else if(strncmp(response, "ERR", 3) == 0)
-                    return BT_RESPONSE::ERR;
                 else if(strncmp(response, "CMD", 3) == 0)
                     return BT_RESPONSE::CMD;
+                else
+                    return BT_RESPONSE::ERR;
             }
             else if (isprint(c))
             {
