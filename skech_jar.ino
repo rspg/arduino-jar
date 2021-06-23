@@ -112,8 +112,6 @@ COMMAND_DATA commands[COMMAND_DATA_MAX];
 // adc
 #define THERMAL_PIN     (0)
 
-#define PULSE_PIN       (12)
-
 #define OLED_ADDRESS    (0x3C)
 
 // heater control factor
@@ -169,7 +167,6 @@ void setup()
     pinMode(BUZZER_PIN, OUTPUT);
     pinMode(HEAT_CTRL_PIN, OUTPUT);
     pinMode(LED_BUILTIN, OUTPUT);
-    pinMode(PULSE_PIN, OUTPUT);
 
     digitalWrite(POWER_ON_PIN, HIGH);
     digitalWrite(HEAT_CTRL_PIN, LOW);
@@ -220,26 +217,19 @@ void setup()
 
 void zeroCrossInterrupt()
 {
-    digitalWrite(PULSE_PIN, digitalRead(ZERO_CROSS_PIN));
-
     static unsigned long lastTime = 0;
-    static unsigned long ticks = 0;
 
     unsigned long now = micros();
     unsigned long d = now - lastTime;
     lastTime = now;
 
-    if(d < 1000) // ignore irregular value
+    if(d < 5000) // ignore irregular value
         return;
     
     zeroCrossInterval = d;
 
-    ticks++;
-    if((ticks&63) == 0)
-    {
-        heatControlMode = HEAT_CTRL_MODE::UP;
-        heatControlTime = now + (zeroCrossInterval>>1) - phaseDelayUs;
-    }
+    heatControlMode = HEAT_CTRL_MODE::UP;
+    heatControlTime = now + (zeroCrossInterval>>1) - 1200;
 }
 
 void timerInterrupt()
@@ -259,10 +249,10 @@ void timerInterrupt()
             case HEAT_CTRL_MODE::UP:
                 {
                     digitalWrite(HEAT_CTRL_PIN, HIGH);
-                    const auto rate = 0;//calcPowerRateFeedbacked();
+                    const auto rate = calcPowerRateFeedbacked();
                     status.power = (char)clamp(rate*100.f, 0.f, 100.f);
                     heatControlMode = HEAT_CTRL_MODE::DOWN;
-                    heatControlTime = now + 1000;//calcHeatPowerDownDuration(rate);
+                    heatControlTime = now + calcHeatPowerDownDuration(rate);
                     break;
                 }
         }
@@ -357,7 +347,6 @@ BT_RESPONSE waitBTResponse(unsigned long timeout)
         while(serialBT.available())
         {
             int c = serialBT.read();
-
             if(c == '\n')
             {
                 response[index] = '\0';
@@ -365,10 +354,10 @@ BT_RESPONSE waitBTResponse(unsigned long timeout)
 
                 if(strncmp(response, "AOK", 3) == 0)
                     return BT_RESPONSE::AOK;
+                else if(strncmp(response, "ERR", 3) == 0)
+                    return BT_RESPONSE::ERR;
                 else if(strncmp(response, "CMD", 3) == 0)
                     return BT_RESPONSE::CMD;
-                else
-                    return BT_RESPONSE::ERR;
             }
             else if (isprint(c))
             {
@@ -684,12 +673,12 @@ void display()
         oled.setCursor(0, 2);
         oledPrint(10, [](){
             oled.print("LEFT:");
-            oled.print((int)zeroCrossInterval);
+            oled.print((int)status.remainTime);
         });  
 
         oledPrint(10, [](){
             oled.print("UDC:");
-            oled.print((int)phaseDelayUs);
+            oled.print((int)count++);
         });
 #endif 
 
