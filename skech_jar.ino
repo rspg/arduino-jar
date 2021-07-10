@@ -75,6 +75,7 @@ enum COMMAND : char
     CMD_SET_KP,
     CMD_SET_TI,
     CMD_SET_PHASE_DELAY,
+    CMD_SET_POWER,
 };
 
 struct COMMAND_DATA
@@ -89,14 +90,19 @@ static_assert(sizeof(COMMAND_DATA) == 8);
 RUNNING_STATE runningState = RUNNING_STATE::BOOT;
 volatile STATUS status;
 volatile unsigned long zeroCrossInterval = 0;
-volatile unsigned long heatControlTime = 0;
+volatile unsigned long heatControlQue[8] = {0};
 volatile HEAT_CTRL_MODE heatControlMode = HEAT_CTRL_MODE::IDLE;
+volatile char heatControlQueWPos = 0;
+volatile char heatControlQueRPos = 0;
 volatile float currentTemperature = 0;
 volatile float targetTemperature = 0;
 volatile float temperatureErrorIntegral = 0;
 volatile float Kp;
 volatile float Ti;
-volatile unsigned short phaseDelayUs = 1200;
+
+volatile unsigned short phaseDelayUs = 0;
+volatile unsigned short powerUserSetting = 0;
+
 COMMAND_DATA commands[COMMAND_DATA_MAX];
 
 // input
@@ -179,15 +185,20 @@ void setup()
     oled.setFont(System5x7);
 #endif
 
+    auto inRange = [](float x, float vmin, float vmax)
+    {
+        return !isnanf(x) && (x >= vmin) && (x < vmax);
+    };
+
     LOG("Setup EEPROM...");
     EEPROM.get(EEPROM_Kp_ADDR, Kp);
-    if(fabsf(Kp) <= __FLT_EPSILON__)
+    if(!inRange(Kp, 0.000001f, 10000.f))
     {
         Kp = 1.0f;
         EEPROM.put(EEPROM_Kp_ADDR, Kp);
     }
     EEPROM.get(EEPROM_Ti_ADDR, Ti);
-    if(fabsf(Ti) <= __FLT_EPSILON__)
+    if(!inRange(Ti, 0.000001f, 10000.f))
     {
         Ti = 1.0f/100.f;
         EEPROM.put(EEPROM_Ti_ADDR, Ti);
@@ -215,6 +226,13 @@ void setup()
     timer1.attachInterrupt(timerInterrupt);
 }
 
+char advanceControlQuePos(volatile char& pos)
+{
+    auto old = pos;
+    pos = (pos + 1)&7;
+    return old;
+}
+
 void zeroCrossInterrupt()
 {
     static unsigned long lastTime = 0;
@@ -225,34 +243,46 @@ void zeroCrossInterrupt()
 
     if(d < 5000) // ignore irregular value
         return;
-    
-    zeroCrossInterval = d;
 
-    heatControlMode = HEAT_CTRL_MODE::UP;
-    heatControlTime = now + (zeroCrossInterval>>1) - 1200;
+    // correct by source frequency 50Hz
+    zeroCrossInterval = 10000;
+
+    const auto rate = (char)clamp(powerUserSetting, 0, 100)/100.f;//calcPowerRateFeedbacked();
+    status.power = (char)(rate*100.f);
+    if(rate > 0)
+    {
+        unsigned long delay = phaseDelayUs;
+        if(delay == 0)
+            delay = (zeroCrossInterval/200)*100 - 1000;
+        auto triggerTime = now + delay + calcHeatPowerHighDelay(rate);
+        heatControlQue[advanceControlQuePos(heatControlQueWPos)] = triggerTime;
+        heatControlQue[advanceControlQuePos(heatControlQueWPos)] = triggerTime + zeroCrossInterval;
+    }
 }
 
 void timerInterrupt()
 {
-    if(heatControlMode == HEAT_CTRL_MODE::IDLE)
-        return;
+    if(heatControlMode == HEAT_CTRL_MODE::IDLE){
+        if(heatControlQueWPos == heatControlQueRPos)
+            return;
+        heatControlMode = HEAT_CTRL_MODE::UP;
+    }
 
     unsigned long now = micros();
-    if(now > heatControlTime)
+    if(now > heatControlQue[heatControlQueRPos])
     {
         switch(heatControlMode)
         {
             case HEAT_CTRL_MODE::DOWN:
                 digitalWrite(HEAT_CTRL_PIN, LOW);
                 heatControlMode = HEAT_CTRL_MODE::IDLE;
+                advanceControlQuePos(heatControlQueRPos);
                 break;
             case HEAT_CTRL_MODE::UP:
                 {
                     digitalWrite(HEAT_CTRL_PIN, HIGH);
-                    const auto rate = calcPowerRateFeedbacked();
-                    status.power = (char)clamp(rate*100.f, 0.f, 100.f);
                     heatControlMode = HEAT_CTRL_MODE::DOWN;
-                    heatControlTime = now + calcHeatPowerDownDuration(rate);
+                    heatControlQue[heatControlQueRPos] = now + 1000;
                     break;
                 }
         }
@@ -267,9 +297,9 @@ float calcPowerRateFeedbacked()
     return currentTemperature < 40.0f ? min(rate, 0.5f) : rate;
 }
 
-unsigned long calcHeatPowerDownDuration(float powerRate)
+unsigned long calcHeatPowerHighDelay(float powerRate)
 {
-    powerRate = max(min(powerRate, 1.f), 0.f);
+    powerRate = 1.0f - clamp(powerRate, 0.f, 1.f);
     return (unsigned long)(acosf(1.f - 2.f*powerRate)*zeroCrossInterval/(float)PI);
 }
 
@@ -339,7 +369,7 @@ void measureTemperature()
 
 BT_RESPONSE waitBTResponse(unsigned long timeout)
 {
-    char response[8];
+    char response[10] = {0};
     char index = 0;
     auto startTime = millis();
     do
@@ -616,6 +646,9 @@ void processCommand()
         case CMD_SET_PHASE_DELAY:
             phaseDelayUs = *reinterpret_cast<unsigned short*>(data.params);
             break;
+        case CMD_SET_POWER:
+            powerUserSetting = *reinterpret_cast<unsigned short*>(data.params);
+            break;
     }
 
     previousTime = now;
@@ -661,33 +694,30 @@ void display()
         });        
 
         oled.setCursor(0, 1);
-        oledPrint(8, [](){
-            oled.print("POW:");
-            oled.print((int)status.power);
-        });  
         oledPrint(12, [](){
-            oled.print("TEMP:");
-            oled.print(status.temperature/256.0);
+            oled.print("ZC:");
+            oled.print(zeroCrossInterval);
         });  
 
         oled.setCursor(0, 2);
         oledPrint(10, [](){
-            oled.print("LEFT:");
-            oled.print((int)status.remainTime);
+            oled.print("UPW:");
+            oled.print((int)powerUserSetting);
         });  
-
         oledPrint(10, [](){
-            oled.print("UDC:");
-            oled.print((int)count++);
+            oled.print("PDU:");
+            oled.print((int)phaseDelayUs);
         });
 #endif 
 
         //
-        char strbuf[64];
+        char strbuf[128];
         auto stbytes = reinterpret_cast<volatile unsigned char*>(&status);
         sprintf(strbuf, "SHW,%s,%02x%02x%02x%02x%02x%02x%02x%02x\n", SERVICE_ID_STATUS_NOTIFY, 
             (int)stbytes[0], (int)stbytes[1], (int)stbytes[2], (int)stbytes[3], (int)stbytes[4], (int)stbytes[5], (int)stbytes[6], (int)stbytes[7]);
-
+#if 0
+        serialBT.write(strbuf);
+#else
         auto sendWithRetry = [&]()
         {
             for(int i = 0; i < 3; ++i)
@@ -695,12 +725,13 @@ void display()
                 serialBT.write(strbuf);
                 if(waitBTResponse(1000) == BT_RESPONSE::AOK)
                     return true;
-                delay(500);
+                delay(100);
             }
             return false;
         };
         if(!sendWithRetry())
             rebootBT();
+#endif
 
         //LOG(strbuf);
     }
