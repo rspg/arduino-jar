@@ -6,7 +6,21 @@
 #include "TimerOne.h"
 
 // debug
-#define LOG(...)        { char buf[256]; sprintf(buf, __VA_ARGS__); Serial.println(buf); }
+template<typename T, typename... Args> void print_log_impl(T&& value, Args&& ...args)
+{
+    Serial.print(value);
+    print_log_impl(args...);
+}
+void print_log_impl()
+{
+    Serial.println();
+}
+template<typename... Args> void print_log(Args&& ...args)
+{
+    print_log_impl(args...);
+}
+
+#define LOG(...)        print_log(__VA_ARGS__)
 #define HAS_OLED        (1)
 
 enum class RUNNING_STATE : char
@@ -97,13 +111,13 @@ volatile char heatControlQueRPos = 0;
 volatile float currentTemperature = 0;
 volatile float targetTemperature = 0;
 volatile float temperatureErrorIntegral = 0;
-volatile float Kp;
-volatile float Ti;
+volatile float Kp = 0;
+volatile float Ti = 0;
 
 volatile unsigned short phaseDelayUs = 0;
 volatile unsigned short powerUserSetting = 0;
 
-COMMAND_DATA commands[COMMAND_DATA_MAX];
+COMMAND_DATA commands[COMMAND_DATA_MAX] = { 0 };
 
 // input
 #define POWER_SW_PIN    (2)
@@ -162,9 +176,9 @@ SoftwareSerial serialBT(10, 9);
 void setup() 
 {
     Serial.begin(9600);
-    LOG("Booting...");
+    LOG(F("Booting..."));
 
-    LOG("Setup io pins...");
+    LOG(F("Setup io pins..."));
     pinMode(POWER_SW_PIN, INPUT);
     pinMode(ZERO_CROSS_PIN, INPUT);
     pinMode(ZERO_CROSS_DUMMY_PIN, INPUT);
@@ -180,7 +194,7 @@ void setup()
     delay(1000);
 
 #if HAS_OLED
-    LOG("Setup OLED...");
+    LOG(F("Setup OLED..."));
     oled.begin(&Adafruit128x32, OLED_ADDRESS);
     oled.setFont(System5x7);
 #endif
@@ -190,7 +204,7 @@ void setup()
         return !isnanf(x) && (x >= vmin) && (x < vmax);
     };
 
-    LOG("Setup EEPROM...");
+    LOG(F("Setup EEPROM..."));
     EEPROM.get(EEPROM_Kp_ADDR, Kp);
     if(!inRange(Kp, 0.000001f, 10000.f))
     {
@@ -204,10 +218,10 @@ void setup()
         EEPROM.put(EEPROM_Ti_ADDR, Ti);
     }
 
-    LOG("Kp = %d.%04d", (int)(Kp), (int)((Kp - (int)Kp)*10000));
-    LOG("Ti = %d.%04d", (int)(Ti), (int)((Ti - (int)Ti)*10000));
+    LOG(F("Kp = "), Kp);
+    LOG(F("Ti = "), Ti);
 
-    LOG("OK");
+    LOG(F("OK"));
 
     pinMode(BUZZER_PIN, OUTPUT);
     tone(BUZZER_PIN, 2000);
@@ -216,7 +230,7 @@ void setup()
     delay(100);
     noTone(BUZZER_PIN);
 
-    serialBT.begin(2400);
+    serialBT.begin(9600);
     rebootBT();
 
     analogReference(INTERNAL);
@@ -357,8 +371,8 @@ void measureTemperature()
             currentTemperature = (B*(T0 + 273))/(logf(r/R0)*(T0 + 273)+B) - 273;
             temperatureErrorIntegral += ((targetTemperature - currentTemperature) - temperatureErrorIntegral)*Ti;
 
-            //LOG("Vtemp = %d", vInt);
-            //LOG("T = %d", (int)(currentTemperature*10));
+            //LOG("Vtemp = ", vInt);
+            //LOG("T = ", (int)(currentTemperature*10));
 
             status.temperature = (short)(currentTemperature*256);
         }
@@ -398,7 +412,7 @@ BT_RESPONSE waitBTResponse(unsigned long timeout)
         }
     }while((unsigned long)(millis() - startTime) < timeout);
 
-    LOG("BT timeout %d < %d", (int)(millis() - startTime), timeout);
+    LOG(F("BT timeout "), (int)(millis() - startTime), " < ", timeout);
 
     return BT_RESPONSE::TIMEOUT;
 }
@@ -411,7 +425,7 @@ void parseBT()
     while(serialBT.available())
     {
         int c = serialBT.read();
-        //Serial.write(c);
+        Serial.write(c);
         if(c == '\n')
         {
             line[index] = '\0';
@@ -450,7 +464,7 @@ void parseBT()
                             status.setCode(STATUS_CODE::COMMAND_OVERFLOW);
                         else
                             commands[index] = command;
-                        LOG("Set command %d, index=%d", (int)command.cmd, (int)index);
+                        LOG("Set command ", (int)command.cmd, ", index=", (int)index);
                     }
                 }
             }
@@ -465,14 +479,14 @@ void parseBT()
 
 void rebootBT()
 {
-    LOG("Reboot BT");
+    LOG(F("Reboot BT"));
     for(int i = 0; i < 3; ++i)
     {
         serialBT.write("R,1\n");
-        delay(200);
+        delay(1000);
         if(waitBTResponse(1000) == BT_RESPONSE::CMD)
         {
-            LOG("OK.");
+            LOG(F("OK."));
             return;
         }
         delay(1000);
@@ -583,7 +597,7 @@ void processCommand()
     const auto delta = now - previousTime;
 
     if(changed)
-        LOG("Active command changed %d -> %d", (int)previousCommand, (int)data.cmd);
+        LOG(F("Active command changed "), (int)previousCommand, F("-> "), (int)data.cmd);
 
     switch(data.cmd)
     {
@@ -600,7 +614,7 @@ void processCommand()
                 {
                     operationTime = 0;
                     targetTemperature = temp;
-                    LOG("Target temp %d.%d", (int)(temp), (int)((temp - (int)temp)*100));
+                    LOG(F("Target temp "), (int)(temp),  F("."), (int)((temp - (int)temp)*100));
                 }
                 if(fabs(currentTemperature - targetTemperature) <= 0.5f)
                     operationTime += delta*us_to_s;
@@ -616,7 +630,7 @@ void processCommand()
                 if(changed)
                 {
                     operationTime = 0;
-                    LOG("Wait sec %d", (int)waitSeconds);
+                    LOG(F("Wait sec "), (int)waitSeconds);
                 }
                 operationTime += delta*us_to_s;
                 const auto remain = max(waitSeconds - operationTime, 0.0f);
@@ -634,20 +648,22 @@ void processCommand()
         case CMD_SET_KP:
             Kp = *reinterpret_cast<float*>(data.params);
             EEPROM.put(EEPROM_Kp_ADDR, Kp);
-            LOG("Set Kp %d", (int)(Kp*256));
+            LOG(F("Set Kp "), Kp);
             ++status.cmdid;
             break;
         case CMD_SET_TI:
             Ti = *reinterpret_cast<float*>(data.params);
             EEPROM.put(EEPROM_Ti_ADDR, Ti);
-            LOG("Set Ti %d", (int)(Ti*256));
+            LOG(F("Set Ti "), Ti);
             ++status.cmdid;
             break;
         case CMD_SET_PHASE_DELAY:
             phaseDelayUs = *reinterpret_cast<unsigned short*>(data.params);
+            LOG(F("Set Phase Delay "), phaseDelayUs);
             break;
         case CMD_SET_POWER:
             powerUserSetting = *reinterpret_cast<unsigned short*>(data.params);
+            LOG(F("Set Power "), powerUserSetting);
             break;
     }
 
@@ -770,7 +786,7 @@ void loop()
             if(poweron == LOW)
             {
                 runningState = RUNNING_STATE::ACTIVE;
-                LOG("Stabled");
+                LOG(F("Stabled"));
                 interrupts();
             }
             break;
@@ -779,7 +795,7 @@ void loop()
             if(poweron == HIGH)
             {
                 runningState = RUNNING_STATE::SHUTDOWN;
-                LOG("Shutdown!!");
+                LOG(F("Shutdown!!"));
                 digitalWrite(POWER_ON_PIN, LOW);
                 tone(BUZZER_PIN, 400, 500);
                 noInterrupts();
