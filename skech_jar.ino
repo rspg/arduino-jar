@@ -5,21 +5,6 @@
 #include "SSD1306AsciiAvrI2c.h"
 #include "TimerOne.h"
 
-// debug
-template<typename T, typename... Args> void print_log_impl(T&& value, Args&& ...args)
-{
-    Serial.print(value);
-    print_log_impl(args...);
-}
-void print_log_impl()
-{
-    Serial.println();
-}
-template<typename... Args> void print_log(Args&& ...args)
-{
-    print_log_impl(args...);
-}
-
 #define LOG(...)        print_log(__VA_ARGS__)
 #define HAS_OLED        (1)
 
@@ -54,6 +39,21 @@ enum class STATUS_CODE : char
     STANDBY = 0, 
     COOKING,
 };
+
+template<typename T, typename... Args> void print_log_impl(T&& value, Args&& ...args)
+{
+    Serial.print(value);
+    print_log_impl(args...);
+}
+void print_log_impl()
+{
+    Serial.println();
+}
+template<typename... Args> void print_log(Args&& ...args)
+{
+    print_log_impl(args...);
+}
+
 struct STATUS
 {
     STATUS_CODE         code = STATUS_CODE::STANDBY;
@@ -65,7 +65,7 @@ struct STATUS
 
     void setCode(STATUS_CODE value) volatile
     {
-        LOG("Error Occurred. code = %d", (int)value);
+        LOG(F("Error Occurred. code = "), (int)value);
         if((int)code >= 0)
             code = value;
     }
@@ -114,8 +114,9 @@ volatile float temperatureErrorIntegral = 0;
 volatile float Kp = 0;
 volatile float Ti = 0;
 
-volatile unsigned short phaseDelayUs = 0;
+volatile unsigned short phaseDelayUs = 400;
 volatile unsigned short powerUserSetting = 0;
+volatile unsigned short currentTemperatureRaw = 0;
 
 COMMAND_DATA commands[COMMAND_DATA_MAX] = { 0 };
 
@@ -230,7 +231,7 @@ void setup()
     delay(100);
     noTone(BUZZER_PIN);
 
-    serialBT.begin(9600);
+    serialBT.begin(2400);
     rebootBT();
 
     analogReference(INTERNAL);
@@ -261,16 +262,26 @@ void zeroCrossInterrupt()
     // correct by source frequency 50Hz
     zeroCrossInterval = 10000;
 
-    const auto rate = (char)clamp(powerUserSetting, 0, 100)/100.f;//calcPowerRateFeedbacked();
+    const auto rate = calcPowerRateFeedbacked();
     status.power = (char)(rate*100.f);
     if(rate > 0)
     {
-        unsigned long delay = phaseDelayUs;
-        if(delay == 0)
-            delay = (zeroCrossInterval/200)*100 - 1000;
-        auto triggerTime = now + delay + calcHeatPowerHighDelay(rate);
-        heatControlQue[advanceControlQuePos(heatControlQueWPos)] = triggerTime;
-        heatControlQue[advanceControlQuePos(heatControlQueWPos)] = triggerTime + zeroCrossInterval;
+        noInterrupts();
+        {
+            if(rate >= 1.0f)
+            {
+                heatControlQueWPos = heatControlQueRPos = 0;
+                digitalWrite(HEAT_CTRL_PIN, HIGH);
+            }
+            else
+            {
+                unsigned long delay = (zeroCrossInterval/200)*100 + phaseDelayUs;
+                auto triggerTime = now + delay + calcHeatPowerHighDelay(max(rate, 0.1f));
+                heatControlQue[advanceControlQuePos(heatControlQueWPos)] = triggerTime;
+                heatControlQue[advanceControlQuePos(heatControlQueWPos)] = triggerTime + zeroCrossInterval;
+            }
+        }
+        interrupts();
     }
 }
 
@@ -337,8 +348,8 @@ void measureTemperature()
 {
     const int VoltageHistories = 5;
     const int AverageHistories = 10;
-    const float B = 3000.f;
-    const float T0 = 22.2f;
+    const float B = 4100.f;
+    const float T0 = 24.5f;
     const float R0 = 58.3f;
     const float Rv = 1.5f;
     const float Vref = 4.7f;
@@ -370,6 +381,8 @@ void measureTemperature()
             const float r = (Rv*Vref*1024.f/1.1f - Rv*vInt)/vInt;
             currentTemperature = (B*(T0 + 273))/(logf(r/R0)*(T0 + 273)+B) - 273;
             temperatureErrorIntegral += ((targetTemperature - currentTemperature) - temperatureErrorIntegral)*Ti;
+
+            currentTemperatureRaw = vInt;
 
             //LOG("Vtemp = ", vInt);
             //LOG("T = ", (int)(currentTemperature*10));
@@ -440,6 +453,7 @@ void parseBT()
                     auto q = strchr(p, '.');
                     if(q == nullptr || (q - p) != 16)
                     {
+                        LOG(line);
                         status.setCode(STATUS_CODE::INVALID_ARGUMENT);
                     }
                     else
@@ -604,8 +618,8 @@ void processCommand()
         case CMD_NOP:
             break;
         case CMD_FINISH:
-            playFinishBeep();
             reset();
+            playFinishBeep();
             break;
         case CMD_TARGET_TEMPERATURE:
             {
@@ -690,7 +704,7 @@ void display()
     static unsigned long count;
 
     auto now = millis();
-    if((unsigned long)(now - interval) >= 1000)
+    if((unsigned long)(now - interval) >= 5000)
     {
         interval = now;
 
@@ -721,8 +735,8 @@ void display()
             oled.print((int)powerUserSetting);
         });  
         oledPrint(10, [](){
-            oled.print("PDU:");
-            oled.print((int)phaseDelayUs);
+            oled.print("TMP:");
+            oled.print((int)currentTemperatureRaw);
         });
 #endif 
 
@@ -731,6 +745,7 @@ void display()
         auto stbytes = reinterpret_cast<volatile unsigned char*>(&status);
         sprintf(strbuf, "SHW,%s,%02x%02x%02x%02x%02x%02x%02x%02x\n", SERVICE_ID_STATUS_NOTIFY, 
             (int)stbytes[0], (int)stbytes[1], (int)stbytes[2], (int)stbytes[3], (int)stbytes[4], (int)stbytes[5], (int)stbytes[6], (int)stbytes[7]);
+        
 #if 0
         serialBT.write(strbuf);
 #else
