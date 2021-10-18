@@ -198,6 +198,7 @@ void setup()
     LOG(F("Setup OLED..."));
     oled.begin(&Adafruit128x32, OLED_ADDRESS);
     oled.setFont(System5x7);
+    oled.displayRemap(true);
 #endif
 
     auto inRange = [](float x, float vmin, float vmax)
@@ -206,16 +207,17 @@ void setup()
     };
 
     LOG(F("Setup EEPROM..."));
+    bool forceWrite = false;
     EEPROM.get(EEPROM_Kp_ADDR, Kp);
-    if(!inRange(Kp, 0.000001f, 10000.f))
+    if(forceWrite || !inRange(Kp, 0.000001f, 10000.f))
     {
-        Kp = 1.0f;
+        Kp = 0.3f;
         EEPROM.put(EEPROM_Kp_ADDR, Kp);
     }
     EEPROM.get(EEPROM_Ti_ADDR, Ti);
-    if(!inRange(Ti, 0.000001f, 10000.f))
+    if(forceWrite || !inRange(Ti, 0.000000f, 90000.f))
     {
-        Ti = 1.0f/100.f;
+        Ti = 1000.f;
         EEPROM.put(EEPROM_Ti_ADDR, Ti);
     }
 
@@ -319,7 +321,7 @@ float calcPowerRateFeedbacked()
     const float e = targetTemperature - currentTemperature;
     const float rate = clamp(Kp*(e + temperatureErrorIntegral), 0.0f, 1.0f);
 
-    return currentTemperature < 40.0f ? min(rate, 0.5f) : rate;
+    return currentTemperature < 30.0f ? min(rate, 0.5f) : rate;
 }
 
 unsigned long calcHeatPowerHighDelay(float powerRate)
@@ -348,8 +350,8 @@ void measureTemperature()
 {
     const int VoltageHistories = 5;
     const int AverageHistories = 10;
-    const float B = 4100.f;
-    const float T0 = 24.5f;
+    const float B = 4000.f;
+    const float T0 = 25.0f;
     const float R0 = 58.3f;
     const float Rv = 1.5f;
     const float Vref = 4.7f;
@@ -380,7 +382,20 @@ void measureTemperature()
 
             const float r = (Rv*Vref*1024.f/1.1f - Rv*vInt)/vInt;
             currentTemperature = (B*(T0 + 273))/(logf(r/R0)*(T0 + 273)+B) - 273;
-            temperatureErrorIntegral += ((targetTemperature - currentTemperature) - temperatureErrorIntegral)*Ti;
+            
+            if(Ti > 0)
+            {
+                temperatureErrorIntegral += (targetTemperature - currentTemperature)/Ti;
+                const float integralLimit = 10e+10f;
+                if(temperatureErrorIntegral > integralLimit)
+                    temperatureErrorIntegral = integralLimit;
+                else if(temperatureErrorIntegral < -integralLimit)
+                    temperatureErrorIntegral = -integralLimit;
+            }
+            else
+            {
+                temperatureErrorIntegral = 0;
+            }
 
             currentTemperatureRaw = vInt;
 
@@ -724,9 +739,17 @@ void display()
         });        
 
         oled.setCursor(0, 1);
-        oledPrint(12, [](){
-            oled.print("ZC:");
-            oled.print(zeroCrossInterval);
+        // oledPrint(12, [](){
+        //     oled.print("ZC:");
+        //     oled.print(zeroCrossInterval);
+        // });  
+        oledPrint(10, [](){
+            oled.print("Kp:");
+            oled.print(Kp);
+        });  
+        oledPrint(10, [](){
+            oled.print("Ti:");
+            oled.print(Ti);
         });  
 
         oled.setCursor(0, 2);
