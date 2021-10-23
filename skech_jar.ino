@@ -1,6 +1,7 @@
 #include <HardwareSerial.h>
 #include <SoftwareSerial.h>
 #include <EEPROM.h>
+#include <float.h>
 #include "SSD1306Ascii.h"
 #include "SSD1306AsciiAvrI2c.h"
 #include "TimerOne.h"
@@ -88,6 +89,7 @@ enum COMMAND : char
     CMD_KEEP,
     CMD_SET_KP,
     CMD_SET_TI,
+    CMD_SET_TD,
     CMD_SET_PHASE_DELAY,
     CMD_SET_POWER,
 };
@@ -110,9 +112,12 @@ volatile char heatControlQueWPos = 0;
 volatile char heatControlQueRPos = 0;
 volatile float currentTemperature = 0;
 volatile float targetTemperature = 0;
+volatile float temperatureError = 0;
 volatile float temperatureErrorIntegral = 0;
+volatile float temperatureErrorDifferential = 0;
 volatile float Kp = 0;
 volatile float Ti = 0;
+volatile float Td = 0;
 
 volatile unsigned short phaseDelayUs = 400;
 volatile unsigned short powerUserSetting = 0;
@@ -138,6 +143,7 @@ COMMAND_DATA commands[COMMAND_DATA_MAX] = { 0 };
 // heater control factor
 #define EEPROM_Kp_ADDR  (0)
 #define EEPROM_Ti_ADDR  (4)
+#define EEPROM_Td_ADDR  (8)
 
 // service id
 #define SERVICE_ID_COMMAND_RECEIVE  "001B"
@@ -208,21 +214,24 @@ void setup()
 
     LOG(F("Setup EEPROM..."));
     bool forceWrite = false;
-    EEPROM.get(EEPROM_Kp_ADDR, Kp);
-    if(forceWrite || !inRange(Kp, 0.000001f, 10000.f))
+
+    auto loadValue = [forceWrite, &inRange](int addr, volatile float& var, float minValue, float maxValue, float defaultValue)
     {
-        Kp = 0.3f;
-        EEPROM.put(EEPROM_Kp_ADDR, Kp);
-    }
-    EEPROM.get(EEPROM_Ti_ADDR, Ti);
-    if(forceWrite || !inRange(Ti, 0.000000f, 90000.f))
-    {
-        Ti = 1000.f;
-        EEPROM.put(EEPROM_Ti_ADDR, Ti);
-    }
+        EEPROM.get(addr, var);
+        if(forceWrite || !inRange(var, minValue, maxValue))
+        {
+            var = defaultValue;
+            EEPROM.put(addr, var);
+        }
+    };
+
+    loadValue(EEPROM_Kp_ADDR, Kp, 0.000001f, 10000.f, 0.3f);
+    loadValue(EEPROM_Ti_ADDR, Ti, 0.000000f, 90000.f, 1000.f);
+    loadValue(EEPROM_Td_ADDR, Td, 0.000000f, 90000.f, 1000.f);
 
     LOG(F("Kp = "), Kp);
     LOG(F("Ti = "), Ti);
+    LOG(F("Td = "), Td);
 
     LOG(F("OK"));
 
@@ -318,9 +327,8 @@ void timerInterrupt()
 
 float calcPowerRateFeedbacked()
 {
-    const float e = targetTemperature - currentTemperature;
-    const float rate = clamp(Kp*(e + temperatureErrorIntegral), 0.0f, 1.0f);
-
+    const float invTi = (Ti>0) ? 1.f/Ti : 0.f;
+    const float rate = clamp(Kp*(temperatureError + invTi*temperatureErrorIntegral + Td*temperatureErrorDifferential), 0.0f, 1.0f);
     return currentTemperature < 30.0f ? min(rate, 0.5f) : rate;
 }
 
@@ -351,7 +359,7 @@ void measureTemperature()
     const int VoltageHistories = 5;
     const int AverageHistories = 10;
     const float B = 4000.f;
-    const float T0 = 25.0f;
+    const float T0 = 27.0f;
     const float R0 = 58.3f;
     const float Rv = 1.5f;
     const float Vref = 4.7f;
@@ -383,19 +391,15 @@ void measureTemperature()
             const float r = (Rv*Vref*1024.f/1.1f - Rv*vInt)/vInt;
             currentTemperature = (B*(T0 + 273))/(logf(r/R0)*(T0 + 273)+B) - 273;
             
-            if(Ti > 0)
-            {
-                temperatureErrorIntegral += (targetTemperature - currentTemperature)/Ti;
-                const float integralLimit = 10e+10f;
-                if(temperatureErrorIntegral > integralLimit)
-                    temperatureErrorIntegral = integralLimit;
-                else if(temperatureErrorIntegral < -integralLimit)
-                    temperatureErrorIntegral = -integralLimit;
-            }
-            else
-            {
-                temperatureErrorIntegral = 0;
-            }
+            const float e = targetTemperature - currentTemperature;
+            temperatureErrorDifferential = e - temperatureError;
+            temperatureError = e;
+            temperatureErrorIntegral += e;
+            const float integralLimit = 10e+10f;
+            if(temperatureErrorIntegral > integralLimit)
+                temperatureErrorIntegral = integralLimit;
+            else if(temperatureErrorIntegral < -integralLimit)
+                temperatureErrorIntegral = -integralLimit;
 
             currentTemperatureRaw = vInt;
 
@@ -609,7 +613,9 @@ void reset()
     status.cmdnum = 0;
     commands[0].cmd = COMMAND::CMD_NOP;
     targetTemperature = 0;
+    temperatureError = 0;
     temperatureErrorIntegral = 0;
+    temperatureErrorDifferential = 0;
 }
 
 void processCommand()
@@ -686,6 +692,12 @@ void processCommand()
             LOG(F("Set Ti "), Ti);
             ++status.cmdid;
             break;
+        case CMD_SET_TD:
+            Td = *reinterpret_cast<float*>(data.params);
+            EEPROM.put(EEPROM_Td_ADDR, Td);
+            LOG(F("Set Td "), Td);
+            ++status.cmdid;
+            break;
         case CMD_SET_PHASE_DELAY:
             phaseDelayUs = *reinterpret_cast<unsigned short*>(data.params);
             LOG(F("Set Phase Delay "), phaseDelayUs);
@@ -751,6 +763,10 @@ void display()
             oled.print("Ti:");
             oled.print(Ti);
         });  
+        oledPrint(10, [](){
+            oled.print("Td:");
+            oled.print(Td);
+        });  
 
         oled.setCursor(0, 2);
         oledPrint(10, [](){
@@ -797,7 +813,9 @@ void run()
     {
         currentTemperature = 0;
         targetTemperature = 0;
+        temperatureError = 0;
         temperatureErrorIntegral = 0;
+        temperatureErrorDifferential = 0;
     }
     else
     {
