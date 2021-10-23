@@ -1,4 +1,4 @@
-﻿#include <HardwareSerial.h>
+#include <HardwareSerial.h>
 #include <SoftwareSerial.h>
 #include <EEPROM.h>
 #include <float.h>
@@ -102,10 +102,12 @@ struct COMMAND_DATA
 };
 static_assert(sizeof(COMMAND_DATA) == 8);
 #define COMMAND_DATA_MAX    (32)
+#define HEAT_CONTROL_QUE_SIZE (4)
 
 RUNNING_STATE runningState = RUNNING_STATE::BOOT;
 volatile STATUS status;
 volatile unsigned long zeroCrossInterval = 0;
+volatile unsigned long heatControlQue[HEAT_CONTROL_QUE_SIZE] = {0};
 volatile HEAT_CTRL_MODE heatControlMode = HEAT_CTRL_MODE::IDLE;
 volatile char heatControlQueWPos = 0;
 volatile char heatControlQueRPos = 0;
@@ -118,6 +120,8 @@ volatile float Kp = 0;
 volatile float Ti = 0;
 volatile float Td = 0;
 
+volatile unsigned short phaseDelayUs = 1200;
+volatile short powerUserSetting = -1;
 volatile unsigned short currentTemperatureRaw = 0;
 
 COMMAND_DATA commands[COMMAND_DATA_MAX] = { 0 };
@@ -252,12 +256,14 @@ void setup()
 char advanceControlQuePos(volatile char& pos)
 {
     auto old = pos;
+    pos = (pos + 1)%HEAT_CONTROL_QUE_SIZE;
     return old;
 }
 
 void zeroCrossInterrupt()
 {
     static unsigned long lastTime = 0;
+    static unsigned short powerOnTiming = 0;
 
     unsigned long now = micros();
     unsigned long d = now - lastTime;
@@ -282,6 +288,21 @@ void zeroCrossInterrupt()
             }
             else
             {
+                const unsigned short decimal = 100;
+                const auto frequency = (unsigned short)min(floorf(decimal/rate), 32767.f);  
+                auto powerOn = [frequency, now](unsigned long delay)
+                {
+                    powerOnTiming += decimal;
+                    if(powerOnTiming >= frequency)
+                    {
+                        heatControlQue[advanceControlQuePos(heatControlQueWPos)] = now + delay;
+                        powerOnTiming = powerOnTiming - frequency;
+                    }
+                };
+
+                unsigned long delay = zeroCrossInterval/2 - phaseDelayUs;
+                powerOn(delay);
+                powerOn(delay + zeroCrossInterval);
             }
         }
         interrupts();
@@ -297,6 +318,7 @@ void timerInterrupt()
     }
 
     unsigned long now = micros();
+    if(now >= heatControlQue[heatControlQueRPos])
     {
         switch(heatControlMode)
         {
@@ -309,6 +331,7 @@ void timerInterrupt()
                 {
                     digitalWrite(HEAT_CTRL_PIN, HIGH);
                     heatControlMode = HEAT_CTRL_MODE::DOWN;
+                    heatControlQue[heatControlQueRPos] = now + 2000;
                     break;
                 }
         }
@@ -318,6 +341,7 @@ void timerInterrupt()
 float calcPowerRateFeedbacked()
 {
     const float invTi = (Ti>0) ? 1.f/Ti : 0.f;
+    const float rate = powerUserSetting>=0 ? powerUserSetting*0.01f : clamp(Kp*(temperatureError + invTi*temperatureErrorIntegral + Td*temperatureErrorDifferential), 0.0f, 1.0f);
     return currentTemperature < 30.0f ? min(rate, 0.5f) : rate;
 }
 
@@ -348,6 +372,7 @@ void measureTemperature()
     const int Samples = 5;
     const int Histories = 10;
     const float B = 4000.f;
+    const float T0 = 25.0f;
     const float R0 = 58.3f;
     const float Rv = 1.5f;
     const float Vref = 4.7f;
@@ -691,6 +716,7 @@ void processCommand()
             LOG(F("Set Phase Delay "), phaseDelayUs);
             break;
         case CMD_SET_POWER:
+            powerUserSetting = *reinterpret_cast<short*>(data.params);
             LOG(F("Set Power "), powerUserSetting);
             break;
     }
