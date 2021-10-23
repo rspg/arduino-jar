@@ -1,4 +1,4 @@
-#include <HardwareSerial.h>
+﻿#include <HardwareSerial.h>
 #include <SoftwareSerial.h>
 #include <EEPROM.h>
 #include <float.h>
@@ -106,7 +106,6 @@ static_assert(sizeof(COMMAND_DATA) == 8);
 RUNNING_STATE runningState = RUNNING_STATE::BOOT;
 volatile STATUS status;
 volatile unsigned long zeroCrossInterval = 0;
-volatile unsigned long heatControlQue[8] = {0};
 volatile HEAT_CTRL_MODE heatControlMode = HEAT_CTRL_MODE::IDLE;
 volatile char heatControlQueWPos = 0;
 volatile char heatControlQueRPos = 0;
@@ -119,8 +118,6 @@ volatile float Kp = 0;
 volatile float Ti = 0;
 volatile float Td = 0;
 
-volatile unsigned short phaseDelayUs = 400;
-volatile unsigned short powerUserSetting = 0;
 volatile unsigned short currentTemperatureRaw = 0;
 
 COMMAND_DATA commands[COMMAND_DATA_MAX] = { 0 };
@@ -226,8 +223,8 @@ void setup()
     };
 
     loadValue(EEPROM_Kp_ADDR, Kp, 0.000001f, 10000.f, 0.3f);
-    loadValue(EEPROM_Ti_ADDR, Ti, 0.000000f, 90000.f, 1000.f);
-    loadValue(EEPROM_Td_ADDR, Td, 0.000000f, 90000.f, 1000.f);
+    loadValue(EEPROM_Ti_ADDR, Ti, 0.000000f, 90000.f, 0.f);
+    loadValue(EEPROM_Td_ADDR, Td, 0.000000f, 90000.f, 0.f);
 
     LOG(F("Kp = "), Kp);
     LOG(F("Ti = "), Ti);
@@ -255,7 +252,6 @@ void setup()
 char advanceControlQuePos(volatile char& pos)
 {
     auto old = pos;
-    pos = (pos + 1)&7;
     return old;
 }
 
@@ -286,10 +282,6 @@ void zeroCrossInterrupt()
             }
             else
             {
-                unsigned long delay = (zeroCrossInterval/200)*100 + phaseDelayUs;
-                auto triggerTime = now + delay + calcHeatPowerHighDelay(max(rate, 0.1f));
-                heatControlQue[advanceControlQuePos(heatControlQueWPos)] = triggerTime;
-                heatControlQue[advanceControlQuePos(heatControlQueWPos)] = triggerTime + zeroCrossInterval;
             }
         }
         interrupts();
@@ -305,7 +297,6 @@ void timerInterrupt()
     }
 
     unsigned long now = micros();
-    if(now > heatControlQue[heatControlQueRPos])
     {
         switch(heatControlMode)
         {
@@ -318,7 +309,6 @@ void timerInterrupt()
                 {
                     digitalWrite(HEAT_CTRL_PIN, HIGH);
                     heatControlMode = HEAT_CTRL_MODE::DOWN;
-                    heatControlQue[heatControlQueRPos] = now + 1000;
                     break;
                 }
         }
@@ -328,7 +318,6 @@ void timerInterrupt()
 float calcPowerRateFeedbacked()
 {
     const float invTi = (Ti>0) ? 1.f/Ti : 0.f;
-    const float rate = clamp(Kp*(temperatureError + invTi*temperatureErrorIntegral + Td*temperatureErrorDifferential), 0.0f, 1.0f);
     return currentTemperature < 30.0f ? min(rate, 0.5f) : rate;
 }
 
@@ -356,40 +345,39 @@ template<typename T> void sort(T* a, int n)
 
 void measureTemperature()
 {
-    const int VoltageHistories = 5;
-    const int AverageHistories = 10;
+    const int Samples = 5;
+    const int Histories = 10;
     const float B = 4000.f;
-    const float T0 = 27.0f;
     const float R0 = 58.3f;
     const float Rv = 1.5f;
     const float Vref = 4.7f;
 
-    static short voltages[VoltageHistories];
-    static short averages[AverageHistories];
-    static char voltageIndex;
-    static char averageIndex;
+    static short samples[Samples];
+    static short histories[Histories];
+    static char sampleIndex;
+    static char historiesIndex;
     static unsigned long measuringInterval;
 
     if(measuringInterval < millis())
     {
-        voltages[voltageIndex++] = analogRead(THERMAL_PIN);
-        if(voltageIndex >= VoltageHistories)
+        // get samples for median cut
+        samples[sampleIndex++] = analogRead(THERMAL_PIN);
+        if(sampleIndex >= Samples)
         {
-            voltageIndex = 0;
-
-            sort(voltages, VoltageHistories);
-
-            averages[averageIndex++] = voltages[VoltageHistories>>1];
-            if(averageIndex >= AverageHistories)
-                averageIndex = 0;
-
+            sampleIndex = 0;
+            sort(samples, Samples);
+            
+            // moving average
+            histories[historiesIndex++] = samples[Samples>>1];
+            if(historiesIndex >= Histories)
+                historiesIndex = 0;
             int vInt = 0;
-            for(auto v : averages) 
+            for(auto v : histories) 
                 vInt += v;
-            vInt /= AverageHistories;    
+            vInt /= Histories;
 
             const float r = (Rv*Vref*1024.f/1.1f - Rv*vInt)/vInt;
-            currentTemperature = (B*(T0 + 273))/(logf(r/R0)*(T0 + 273)+B) - 273;
+            currentTemperature = max((B*(T0 + 273))/(logf(r/R0)*(T0 + 273)+B) - 273, 0.f);
             
             const float e = targetTemperature - currentTemperature;
             temperatureErrorDifferential = e - temperatureError;
@@ -409,7 +397,7 @@ void measureTemperature()
             status.temperature = (short)(currentTemperature*256);
         }
 
-        measuringInterval = millis() + 1000/VoltageHistories;
+        measuringInterval = millis() + 1000/Samples;
     }
 }
 
@@ -703,7 +691,6 @@ void processCommand()
             LOG(F("Set Phase Delay "), phaseDelayUs);
             break;
         case CMD_SET_POWER:
-            powerUserSetting = *reinterpret_cast<unsigned short*>(data.params);
             LOG(F("Set Power "), powerUserSetting);
             break;
     }
@@ -737,46 +724,34 @@ void display()
 
 #if HAS_OLED
         oled.home();
-        oledPrint(7, [](){
+        oledPrint(20, [](){
             oled.print("ST:");
             oled.print((int)status.code);
-        });
-        oledPrint(6, [](){
-            oled.print("ID:");
+            oled.print("/");
             oled.print((int)status.cmdid);
-        });
-        oledPrint(6, [](){
-            oled.print("CNT:");
+            oled.print("/");
             oled.print((int)status.cmdnum);
-        });        
+            oled.print("/");
+            oled.print((int)status.power);
+            oled.print("/");
+            oled.print(status.temperature/256.f);
+        });    
 
         oled.setCursor(0, 1);
-        // oledPrint(12, [](){
-        //     oled.print("ZC:");
-        //     oled.print(zeroCrossInterval);
-        // });  
-        oledPrint(10, [](){
-            oled.print("Kp:");
+        oledPrint(20, [](){
+            oled.print("PID:");
             oled.print(Kp);
-        });  
-        oledPrint(10, [](){
-            oled.print("Ti:");
+            oled.print('/');
             oled.print(Ti);
-        });  
-        oledPrint(10, [](){
-            oled.print("Td:");
+            oled.print('/');
             oled.print(Td);
         });  
 
         oled.setCursor(0, 2);
         oledPrint(10, [](){
-            oled.print("UPW:");
-            oled.print((int)powerUserSetting);
-        });  
-        oledPrint(10, [](){
-            oled.print("TMP:");
+            oled.print("CTL:");
             oled.print((int)currentTemperatureRaw);
-        });
+        });  
 #endif 
 
         //
