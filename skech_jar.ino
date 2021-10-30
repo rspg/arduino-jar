@@ -307,6 +307,10 @@ void zeroCrossInterrupt()
         }
         interrupts();
     }
+    else
+    {
+        digitalWrite(HEAT_CTRL_PIN, LOW);
+    }
 }
 
 void timerInterrupt()
@@ -586,7 +590,7 @@ void playFinishBeep()
     noTone(BUZZER_PIN);
 }
 
-void playNotficationBeep()
+void playWarmedBeep()
 {
     static const int T= 100;
     auto wait = [](int n){ delay(n*T*2); };
@@ -620,6 +624,18 @@ void playNotficationBeep()
     noTone(BUZZER_PIN);
 }
 
+void playTimeupBeep()
+{
+    static const int T= 50;
+    auto wait = [](int n){ delay(n*T*2); };
+
+    tone(BUZZER_PIN, TONE_RA5); wait(1);
+    tone(BUZZER_PIN, TONE_RA5); wait(1);
+    tone(BUZZER_PIN, TONE_RA5); wait(1);
+
+    noTone(BUZZER_PIN);
+}
+
 void reset()
 {
     status.cmdid = 0;
@@ -637,6 +653,7 @@ void processCommand()
 
     static char previousCommand = CMD_NOP;
     static float operationTime = 0;
+    static char errorCount = 0;
     static unsigned long previousTime = micros();
     auto& data = commands[status.cmdid];
 
@@ -657,19 +674,27 @@ void processCommand()
             break;
         case CMD_TARGET_TEMPERATURE:
             {
-                const auto temp = (float)*reinterpret_cast<unsigned char*>(data.params);
+                const float targetOffset = 0.0f;
+                const float passingRange = 1.0f;
+                const float passingDuration = 300.f;
+                const auto temp = (float)*reinterpret_cast<unsigned char*>(data.params) + targetOffset;
                 if(changed || targetTemperature != temp)
                 {
                     operationTime = 0;
+                    errorCount = 0;
                     targetTemperature = temp;
                     LOG(F("Target temp "), (int)(temp),  F("."), (int)((temp - (int)temp)*100));
                 }
-                if(fabs(currentTemperature - targetTemperature) <= 0.5f)
+                
+                if(fabs(currentTemperature - targetTemperature + targetOffset) <= passingRange)
                     operationTime += delta*us_to_s;
                 else 
                     operationTime = 0;
-                if(operationTime > 120.f)
+                if(operationTime >= passingDuration)
+                {
+                    playWarmedBeep();
                     ++status.cmdid;
+                }
             }
             break;
         case CMD_KEEP:
@@ -688,7 +713,7 @@ void processCommand()
                     status.remainTime = (unsigned short)ceilf(remain / 60.f) | 0x8000;
                 if(operationTime >= waitSeconds)
                 {
-                    playNotficationBeep();
+                    playTimeupBeep();
                     ++status.cmdid;
                 }
             }
